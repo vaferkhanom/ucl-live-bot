@@ -1,6 +1,7 @@
 *.db
 *.sqlite
 data.db*
+bot.log
 __pycache__/
 *.pyc
 .env
