@@ -217,14 +217,14 @@ class Bot:
     def classify(self, ke):
         t = (ke.get("type") or "").lower()
         text = (ke.get("text") or "").lower()
-        if t == "goal":
+        # ESPN emits goal variants: 'Goal', 'Goal - Header', 'Goal - Free Kick'...
+        # FotMob emits 'OwnGoal' -> 'own goal'. Catch them all.
+        if t == "goal" or t.startswith("goal -") or "own goal" in t:
             if "disallowed" in text:
                 return "disallowed"
-            if "own goal" in text:
+            if "own goal" in text or "own goal" in t:
                 return "own_goal"
             return "goal"
-        if t in ("own goal", "goal - own goal"):
-            return "own_goal"
         if t == "penalty - scored":
             return "goal"
         if t == "penalty - missed":
@@ -323,15 +323,25 @@ class Bot:
         # ---- status transitions (HT can arrive without keyEvent) ----
         state = s["status"]["state"]
         detail = (s["status"].get("detail") or "").upper()
+        at_ht = "HALF TIME" in detail or detail.startswith("HT")
         if state == "in":
             st.live = True
             if "ko" not in st.statuses and KICKOFF_MSG:
                 st.statuses.add("ko")
                 self.publish(F.render_ko(comp), f"{mid}|status-ko", mid)
-            if ("HALF TIME" in detail) and "ht" not in st.statuses:
+            if at_ht and "ht" not in st.statuses:
                 st.statuses.add("ht")
                 pts = self.points_lines(s) if FANTASY else None
                 self.publish(F.render_ht(comp, pts), f"{mid}|status-ht", mid)
+            elif not at_ht and "ht" in st.statuses and \
+                    "second_half" not in st.statuses and "ko" in st.statuses:
+                # ESPN shortDetail never says 'HALF TIME' (it is 'HT'); and the
+                # 2nd half may start without a usable keyEvent. After HT, any
+                # in-play detail (clock minute) means the 2nd half is running.
+                m_int = FY.minute_value(detail)
+                if m_int is not None and m_int >= 46:
+                    st.statuses.add("second_half")
+                    self.publish(F.render_second_half(comp), f"{mid}|status-2h", mid)
         elif state == "post":
             st.live = False
             self.do_ft(mid, comp, s)
@@ -414,16 +424,28 @@ class Bot:
         st = self.ensure_state(mid)
         minute = F.norm_minute(ke.get("minute"))
         players = ke.get("players") or []
-        team_id = ke.get("team_id") or ke.get("team") or ""
-        side, _ = None, None
-        emoji_side, side = F.team_side_emoji(comp, team_id)
+        team_id = str(ke.get("team_id") or "")
+        emoji_side, side = F.team_side_emoji(comp, team_id) if team_id else (None, None)
         if not side and ke.get("team") in ("home", "away"):
             side = ke.get("team")   # FotMob events carry 'home'/'away' directly
+            cid = (comp.get(side) or {}).get("id")
+            if cid:
+                # map to the ESPN id so renderers resolve color emoji + abbr
+                team_id = str(cid)
+                emoji_side, _ = F.team_side_emoji(comp, team_id)
         text_l = (ke.get("text") or "").lower()
         # ---- cross-source dedupe: ESPN replays what FotMob already sent ----
-        dup_probe = (kind, str(minute), (players[0] if players else "").lower())
-        if new and kind not in ("pen_awarded",) and dup_probe in st.seen_ev:
-            return
+        # names differ across sources (Matias/Matías) and stoppage minutes are
+        # notated differently (90+2 vs 92): accent-fold the player and allow
+        # +/-2 min once stoppage time is in play.
+        probe = (kind, self._probe_key(players[0] if players else ""))
+        m_int = FY.minute_value(minute)
+        if new and kind != "pen_awarded":
+            for (k2, p2), (m2, _ek) in st.seen_ev.items():
+                if k2 == kind and p2 == probe[1] and \
+                        m_int is not None and m2 is not None and \
+                        abs(m_int - m2) <= (2 if max(m_int, m2) >= 45 else 0):
+                    return
 
         if kind in ("goal", "own_goal"):
             scorer = F.event_lastname_upper(players[0]) if players else "?"
@@ -437,11 +459,18 @@ class Bot:
                         side = ha
                         break
                 side = side or "home"
+            # FotMob knows the exact post-goal score — never render a stale one
+            rcomp = comp
+            ns = ke.get("new_score")
+            if ns and (comp.get("home") and comp.get("away")):
+                rcomp = {k: dict(v) for k, v in comp.items()}
+                rcomp["home"]["score"] = int(ns[0])
+                rcomp["away"]["score"] = int(ns[1])
             ev_key = self.event_key(mid, ke, kind)
-            txt = F.render_goal(comp, side, scorer, assist, minute,
+            txt = F.render_goal(rcomp, side, scorer, assist, minute,
                                 penalty=is_pen, own_goal=(kind == "own_goal"))
             if new:
-                st.seen_ev[dup_probe] = ev_key
+                st.seen_ev[probe] = (m_int, ev_key)
                 st.goal_msgs.append((str(ke.get("id")), side, ev_key))
                 self.publish(txt, ev_key, mid)
             else:
@@ -460,7 +489,7 @@ class Bot:
             ev_key = self.event_key(mid, ke, kind)
             txt = F.render_card(comp, team_id, p, kind, minute)
             if new:
-                st.seen_ev[dup_probe] = ev_key
+                st.seen_ev[probe] = (m_int, ev_key)
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
@@ -486,7 +515,7 @@ class Bot:
             txt = F.render_sub(comp, team_id, pin, pout, minute)
             ev_key = self.event_key(mid, ke, kind)
             if new:
-                st.seen_ev[dup_probe] = ev_key
+                st.seen_ev[probe] = (m_int, ev_key)
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
@@ -512,12 +541,11 @@ class Bot:
         tallies = {}
         for k in s.get("keyEvents") or []:
             kind = self.classify(k)
-            if kind in ("goal", "own_goal", "pen_saved", "pen_missed"):
+            if kind != "goal":
                 continue
             players = k.get("players") or []
-            if kind == "goal" and players:
-                t = tallies.setdefault(players[0], 0)
-                tallies[players[0]] = t + 1
+            if players:
+                tallies[players[0]] = tallies.get(players[0], 0) + 1
         lines = [f"{n} - {F.fmt_name(p)}" for p, n in sorted(tallies.items(), key=lambda x: -x[1])]
         return lines or None
 
@@ -599,6 +627,13 @@ class Bot:
     # ---------------- watchdog (365scores) ----------------
     def _norm(self, s):
         return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+
+    def _probe_key(self, s):
+        """Accent-folded key for cross-source player dedupe (Matias == Matías)."""
+        import unicodedata as _ud
+        n = _ud.normalize("NFKD", s or "")
+        n = "".join(ch for ch in n if not _ud.combining(ch))
+        return re.sub(r"[^a-z0-9 ]", "", n.lower()).strip()
 
     def watch_tick(self):
         """Cheap 365scores check (~30KB). On any clock/score/status change for a

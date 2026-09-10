@@ -16,9 +16,11 @@ Status: header.status{started, finished, ongoing, cancelled, liveTime{short,long
 ID resolution: /api/data/matches?date=YYYYMMDD -> leagues[].matches[] (id,
   home{name}, away{name}, status{utcTime}).
 """
+import difflib
 import json
 import re
 import urllib.request
+import unicodedata
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
@@ -117,10 +119,12 @@ _day_cache = {"date": None, "ids": None}
 
 
 def find_ids(home_name, away_name, timeout=10):
-    """FotMob match ids for today's game matching team names (contains-match).
+    """FotMob match id for today's game matching team names.
 
-    Uses today's FotMob fixtures (one request/day cached) — no ESPN id mapping
-    needed since FotMob ids are independent.
+    Returns AT MOST ONE id (the best candidate). Youth/II teams never match
+    senior targets (and vice versa) — a senior game must never inherit events
+    from its U19 twin. Transliteration variants (München/Munich, Bodø/Bodo)
+    are matched via difflib ratio on accent-folded names.
     """
     import datetime
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
@@ -128,36 +132,44 @@ def find_ids(home_name, away_name, timeout=10):
         _day_cache["date"] = today
         _day_cache["ids"] = day_ids(today, timeout)
     ids = _day_cache["ids"] or {}
-    import re as _re
-    import unicodedata as _ud
 
     def norm(s):
-        s = _ud.normalize("NFKD", s or "")
-        s = "".join(ch for ch in s if not _ud.combining(ch))
-        return _re.sub(r"[^a-z0-9]", "", s.lower())
+        s = unicodedata.normalize("NFKD", s or "")
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    youth = re.compile(r"(u19|u21|u23|ii)$")
+
+    def score(target, cand):
+        if not target or not cand:
+            return 0.0
+        # senior <-> youth mismatch is always a wrong match
+        if bool(youth.search(target)) != bool(youth.search(cand)):
+            return 0.0
+        if target == cand:
+            return 3.0
+        t2, c2 = youth.sub("", target), youth.sub("", cand)
+        if t2 and t2 == c2:
+            return 2.5
+        r = difflib.SequenceMatcher(None, target, cand).ratio()
+        if r >= 0.84:                      # transliteration variants
+            return 1.5 + r
+        if target in cand or cand in target:
+            return 1.0
+        return 0.0
 
     h, a = norm(home_name), norm(away_name)
-    scored = []
+    best = None
     for mid, row in ids.items():
         fh, fa = norm(row.get("home")), norm(row.get("away"))
         if not fh or not fa:
             continue
-        # exact match beats substring; also try without U19/II suffixes
-        def score(target, cand):
-            if target == cand:
-                return 3
-            t2 = _re.sub(r"(u19|u21|u23|ii|b)$", "", target)
-            c2 = _re.sub(r"(u19|u21|u23|ii|b)$", "", cand)
-            if t2 and (t2 == c2):
-                return 2
-            if target in cand or cand in target:
-                return 1
-            return 0
         sh, sa = score(h, fh), score(a, fa)
-        if sh and sa:
-            scored.append((sh + sa, mid))
-    scored.sort(reverse=True)
-    return [mid for _, mid in scored]
+        if sh >= 1.0 and sa >= 1.0:
+            total = sh + sa
+            if best is None or total > best[0] or (total == best[0] and mid < best[1]):
+                best = (total, mid)
+    return [best[1]] if best and best[0] >= 3.0 else []
 
 
 # ---------------- event normalization -> bot's ke schema ----------------
@@ -178,28 +190,34 @@ def normalize_events(f):
         base_id = e.get("eventId") or e.get("reactKey") or f"{t}-{i}"
         ke = {"id": f"fm-{base_id}", "type": t, "minute": minute,
               "team": team, "players": [], "text": ""}
-        if t == "Goal":
-            ke["type"] = "goal"
-            players = [pname]
-            ast = e.get("assistStr") or ""
-            m = re.match(r"assist by (.+)", ast)
-            if m:
-                players.append(m.group(1))
-            txt = []
-            if e.get("suffix"):
-                txt.append(e["suffix"])      # 'Penalty', 'Header'
-            if e.get("goalDescription"):
-                txt.append(e["goalDescription"])
-            ke["text"] = " - ".join(txt)
-            ke["players"] = players
-        elif t == "OwnGoal":
-            ke["type"] = "own goal"
-            ke["players"] = [pname]
+        ns = e.get("newScore")
+        if isinstance(ns, (list, tuple)) and len(ns) == 2:
+            try:
+                ke["new_score"] = [int(ns[0]), int(ns[1])]
+            except (TypeError, ValueError):
+                pass
+        if t == "Goal" or (t == "OwnGoal") or e.get("ownGoal"):
+            ke["type"] = "goal" if not (t == "OwnGoal" or e.get("ownGoal")) else "own goal"
+            if ke["type"] == "own goal":
+                ke["players"] = [pname]
+            else:
+                players = [pname]
+                ast = e.get("assistStr") or ""
+                m = re.match(r"assist by (.+)", ast)
+                if m:
+                    players.append(m.group(1))
+                txt = []
+                if e.get("suffix"):
+                    txt.append(e["suffix"])      # 'Penalty', 'Header'
+                if e.get("goalDescription"):
+                    txt.append(e["goalDescription"])
+                ke["text"] = " - ".join(txt)
+                ke["players"] = players
         elif t == "Card":
             card = (e.get("card") or "Yellow")
             if card == "Yellow":
                 ke["type"] = "yellow card"
-            elif card == "YellowRed":
+            elif card in ("YellowRed", "SecondYellow"):
                 ke["type"] = "red card"
                 ke["text"] = "second yellow"
             else:
