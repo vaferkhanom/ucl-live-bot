@@ -7,7 +7,15 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 # ---- optional tuning ----
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))          # live match poll interval
 SCOREBOARD_SECONDS = int(os.environ.get("SCOREBOARD_SECONDS", "90"))  # fixture discovery interval
-DB_PATH = os.environ.get("DB_PATH", "data.db")
+# Railway: use persistent volume at /data when mounted, else local file.
+# Set DB_PATH explicitly to override (e.g. DB_PATH=/data/data.db with a volume at /data).
+def _default_db():
+    if os.environ.get("DB_PATH"):
+        return os.environ["DB_PATH"]
+    if os.path.isdir("/data"):
+        return "/data/data.db"
+    return "data.db"
+DB_PATH = _default_db()
 LEAGUE_SLUG = os.environ.get("LEAGUE_SLUG", "uefa.champions")
 SHOW_STATS_BLOCK = os.environ.get("STATS_BLOCK", "1") == "1"      # stats table at FT
 SHOW_LINEUPS = os.environ.get("LINEUPS", "1") == "1"              # auto lineups pre-match
