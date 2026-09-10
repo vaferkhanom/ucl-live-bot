@@ -19,6 +19,7 @@ from config import (BOT_TOKEN, OWNER_ID, LEAGUE_SLUG, POLL_SECONDS,
 from tg import TG, TGError
 from store import Store
 import espn
+import scores365
 import formatter as F
 import fantasy as FY
 
@@ -42,6 +43,7 @@ class MatchState:
         self.disallowed = set()      # event_keys already edited/flagged disallowed
         self.last_summary = None
         self.pre_checks = 0
+        self.watch_fp = ""          # 365scores fingerprint (watchdog)
 
 
 class Bot:
@@ -468,6 +470,47 @@ class Bot:
             except TGError as e:
                 print(f"[edit fail {chat_id}] {e}", flush=True)
 
+    # ---------------- watchdog (365scores) ----------------
+    def _norm(self, s):
+        return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+
+    def watch_tick(self):
+        """Cheap 365scores check (~30KB). On any clock/score/status change for a
+        match we track, force an immediate ESPN poll of that match."""
+        with self.lock:
+            any_live = any(m.get("state") == "in" for m in self.matches.values())
+        if not any_live:
+            return
+        try:
+            live = scores365.live_ucl()
+        except Exception as e:  # noqa: BLE001
+            print("watchdog fail:", e, flush=True)
+            return
+        with self.lock:
+            tracked = [(mid, (m.get("home") or {}).get("name"), (m.get("away") or {}).get("name"))
+                       for mid, m in self.matches.items()]
+        for mid, hname, aname in tracked:
+            st = self.ensure_state(mid)
+            with self.lock:
+                mstate = self.matches.get(mid, {}).get("state")
+            if mstate != "in":
+                continue
+            hn, an = self._norm(hname), self._norm(aname)
+            if not hn or not an:
+                continue
+            row = next((r for r in live.values()
+                        if (hn in r["home"] or r["home"] in hn)
+                        and (an in r["away"] or r["away"] in an)), None)
+            if not row:
+                continue
+            fp = scores365.fingerprint(row)
+            if fp != st.watch_fp:
+                changed = bool(st.watch_fp)
+                st.watch_fp = fp
+                # score/status change → poll right now; clock-only → within POLL_SECONDS
+                if changed:
+                    st.next_poll = 0.0
+
     # ---------------- tracker thread ----------------
     def tracker(self):
         self.refresh_board()
@@ -475,6 +518,7 @@ class Bot:
             try:
                 if time.time() - self.last_board >= SCOREBOARD_SECONDS:
                     self.refresh_board()
+                self.watch_tick()
                 now = time.time()
                 with self.lock:
                     snapshot = [(mid, m.get("state")) for mid, m in self.matches.items()]
