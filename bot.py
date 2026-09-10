@@ -84,11 +84,18 @@ class Bot:
     # ---------------- admin panel ----------------
     PANEL_MAX_ROWS = 12
 
-    def panel_row(self, m, mutes):
-        """One panel button: '96' FER v ROM 2-4 90' 🔇/🔴/⏳"""
+    def panel_row(self, m, mutes, pending=None):
+        """One panel button: '96' FER v ROM 2-4 90' 🔇/🔴/⏳
+
+        pending = {mid: 'mute'|'unmute'} changes staged but NOT applied yet."""
         h, a = m.get("home") or {}, m.get("away") or {}
         mid = str(m["id"])
+        pend = (pending or {}).get(mid)
         muted = "🔇 " if mid in mutes else ""
+        if pend == "mute":
+            muted = "🕓🔇 "      # staged: will be muted on confirm
+        elif pend == "unmute":
+            muted = "🕓🔊 "      # staged: will be unmuted on confirm
         if m.get("state") == "in":
             st_emoji = "🔴"
             score = f" {h.get('score', 0)}-{a.get('score', 0)}"
@@ -110,46 +117,63 @@ class Bot:
             pass
         label = (f"{st_emoji}{muted} {h.get('abbr')} v {a.get('abbr')}"
                  f"{score}{clock} · {when}")
-        action = "unmute" if mid in mutes else "pmute"
+        if pend == "mute":
+            action = "pst unmute"     # second click cancels the staged mute
+        elif pend == "unmute":
+            action = "pst mute"
+        elif mid in mutes:
+            action = "pst unmute"
+        else:
+            action = "pst mute"
         return [{"text": label, "callback_data": f"{action}:{mid}"}]
 
+    def _pend(self):
+        """Staged panel changes: {match_id: 'mute'|'unmute'} (in RAM only)."""
+        if not hasattr(self, "_pending"):
+            self._pending = {}
+        return self._pending
+
+    def _panel_kb(self, ms, mutes, pending=None):
+        btns = [self.panel_row(m, mutes, pending) for m in ms[: self.PANEL_MAX_ROWS]]
+        pend = pending or {}
+        rows = [[{"text": "🔇 موت همه", "callback_data": "pst mute:all"},
+                 {"text": "🔊 وصل همه", "callback_data": "pst unmute:all"}]]
+        if pend:
+            rows.insert(0, [{"text": f"✔️ ثبت تغییرات ({len(pend)})", "callback_data": "papply"},
+                            {"text": "✖️ لغو همه", "callback_data": "pcancel"}])
+        rows.append([{"text": "🔄 رفرش", "callback_data": "prefresh"},
+                     {"text": "❌ بستن", "callback_data": "close"}])
+        return {"inline_keyboard": btns + rows}
+
+    def _panel_head(self, ms, mutes, pending=None):
+        live = sum(1 for m in ms if m.get("state") == "in")
+        pend = pending or {}
+        head = (f"🎮 <b>پنل ادمین</b> — {len(ms)} بازی"
+                f" | 🔴 {live} لایو | 🔇 {len(mutes)} موت\n"
+                f"تاریخ: {datetime.datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')} تهران\n")
+        if pend:
+            head += (f"⚠️ <b>{len(pend)} تغییر در انتظار ثبت</b> (🕓)\n"
+                     "<i>با ✔️ ثبت تغییرات اعمال میشه — تا قبلش خبری نمیاد!</i>")
+        else:
+            head += "<i>کلیک = انتخاب | ✔️ ثبت = اعمال</i>"
+        return head
+
     def cmd_panel(self, chat_id):
-        """One-tap admin panel: every match = one glass button. Always current:
-        refresh_board() prunes finished/yesterday matches (grace for live FT)."""
+        """One-tap admin panel: every match = one glass button. Changes are
+        STAGED (🕓) until ✔️ ثبت. refresh_board() prunes old matches daily."""
         self.refresh_board()
         with self.lock:
             ms = sorted(self.matches.values(), key=lambda m: m.get("date") or "")
         mutes = self.store.mutes()
-        btns = [self.panel_row(m, mutes) for m in ms[: self.PANEL_MAX_ROWS]]
-        if not btns:
+        if not ms:
             self.tg.send(chat_id, "🎮 <b>پنل ادمین</b>\n\nالان هیچ بازی‌ای نیست — "
                                   "به‌محض اینکه برنامه چمپیونزلیگ اعلام بشه خودش اینجا میاد.")
             return
-        live = sum(1 for m in ms if m.get("state") == "in")
-        muted_n = len(mutes)
-        head = (f"🎮 <b>پنل ادمین</b> — {len(ms)} بازی"
-                f" | 🔴 {live} لایو | 🔇 {muted_n} موت\n"
-                f"تاریخ: {datetime.datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')} تهران\n"
-                "<i>کلیک = قطع/وصل نوتیف همون بازی</i>")
-        kb = {"inline_keyboard": btns + [
-            [{"text": "🔇 موت همهٔ امروز", "callback_data": "pmute:all"},
-             {"text": "🔊 وصل همه", "callback_data": "punmute:all"}],
-            [{"text": "🔄 رفرش", "callback_data": "prefresh"},
-             {"text": "❌ بستن", "callback_data": "close"}],
-        ]}
-        msg = self.tg.send(chat_id, head, kb=kb)
+        msg = self.tg.send(chat_id, self._panel_head(ms, mutes, self._pend()),
+                           kb=self._panel_kb(ms, mutes, self._pend()))
         if msg and msg.get("message_id"):
             self.store.kv_set("panel_msg", f"{chat_id}:{msg['message_id']}")
             self._panel_fp = None   # force next push to re-sync
-
-    def _panel_kb(self, ms, mutes):
-        btns = [self.panel_row(m, mutes) for m in ms[: self.PANEL_MAX_ROWS]]
-        return {"inline_keyboard": btns + [
-            [{"text": "🔇 موت همهٔ امروز", "callback_data": "pmute:all"},
-             {"text": "🔊 وصل همه", "callback_data": "punmute:all"}],
-            [{"text": "🔄 رفرش", "callback_data": "prefresh"},
-             {"text": "❌ بستن", "callback_data": "close"}],
-        ]}
 
     # ---------------- scoreboard ----------------
     def refresh_board(self):
@@ -840,33 +864,56 @@ class Bot:
             except TGError:
                 pass
             return
-        if data.startswith("mute:") or data.startswith("pmute:"):
-            mid = data.split(":", 1)[1]
+        if data.startswith("pst "):
+            # STAGE a change (not applied yet): 'pst mute:ID' | 'pst unmute:ID'
+            action, mid = data[4:].split(":", 1)
+            pend = self._pend()
             if mid == "all":
-                n = 0
                 with self.lock:
                     ms = [m for m in self.matches.values() if m.get("state") != "post"]
                 for m in ms:
-                    h, a = m.get("home") or {}, m.get("away") or {}
-                    self.store.mute(str(m["id"]), f"{h.get('abbr')} vs {a.get('abbr')}")
-                    n += 1
-                self.tg.answer_callback(cb.get("id"), f"🔇 {n} بازی موت شد")
-                self._panel_reedit(chat_id, msg_id)
-                return
-            m = self.matches.get(mid) or {}
-            h, a = m.get("home") or {}, m.get("away") or {}
-            label = f"{h.get('abbr')} vs {a.get('abbr')}"
-            self.store.mute(mid, label)
-            self.tg.answer_callback(cb.get("id"), f"🔇 {label} موت شد")
-            self._panel_reedit(chat_id, msg_id)
-        elif data.startswith("unmute:") or data.startswith("punmute:"):
-            mid = data.split(":", 1)[1]
-            if mid == "all":
-                self.store.unmute_all()
-                self.tg.answer_callback(cb.get("id"), "🔊 همه وصل شدن")
+                    if action == "mute":
+                        if str(m["id"]) not in self.store.mutes():
+                            pend[str(m["id"])] = "mute"
+                    else:
+                        if str(m["id"]) in self.store.mutes() or \
+                           pend.get(str(m["id"])) == "mute":
+                            pend[str(m["id"])] = "unmute"
+                self.tg.answer_callback(cb.get("id"),
+                                        f"🕓 {len(ms)} بازی انتخاب شد — با ✔️ ثبت کن")
             else:
-                self.store.unmute(mid)
-                self.tg.answer_callback(cb.get("id"), "🔊 وصل شد")
+                cur = self.store.mutes()
+                cur_state = "mute" if mid in cur else (
+                    "unmute" if pend.get(mid) == "mute" else None)
+                nxt = "mute" if action == "mute" else "unmute"
+                if nxt == cur_state or (pend.get(mid) == nxt):
+                    pend.pop(mid, None)     # clicking back = cancel staged change
+                else:
+                    pend[mid] = nxt
+                self.tg.answer_callback(cb.get("id"),
+                                        f"🕓 انتخاب شد — با ✔️ ثبت ({len(pend)} در صف)")
+            self._panel_reedit(chat_id, msg_id)
+        elif data == "papply":
+            pend = self._pend()
+            if not pend:
+                self.tg.answer_callback(cb.get("id"), "چیزی برای ثبت نیست")
+                return
+            cur = self.store.mutes()
+            for mid, act in list(pend.items()):
+                if act == "mute" and mid not in cur:
+                    m = self.matches.get(mid) or {}
+                    h, a = m.get("home") or {}, m.get("away") or {}
+                    self.store.mute(mid, f"{h.get('abbr')} vs {a.get('abbr')}")
+                elif act == "unmute":
+                    self.store.unmute(mid)
+            n = len(pend)
+            pend.clear()
+            self._panel_fp = None
+            self.tg.answer_callback(cb.get("id"), f"✅ {n} تغییر ثبت شد")
+            self._panel_reedit(chat_id, msg_id)
+        elif data == "pcancel":
+            self._pend().clear()
+            self.tg.answer_callback(cb.get("id"), "✖️ تغییرات لغو شد")
             self._panel_reedit(chat_id, msg_id)
         elif data == "prefresh":
             self._panel_reedit(chat_id, msg_id)
@@ -881,12 +928,9 @@ class Bot:
             mutes = self.store.mutes()
             if not ms:
                 return
-            live = sum(1 for m in ms if m.get("state") == "in")
-            head = (f"🎮 <b>پنل ادمین</b> — {len(ms)} بازی"
-                    f" | 🔴 {live} لایو | 🔇 {len(mutes)} موت\n"
-                    f"تاریخ: {datetime.datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')} تهران\n"
-                    "<i>کلیک = قطع/وصل نوتیف همون بازی</i>")
-            self.tg.edit(chat_id, msg_id, head, kb=self._panel_kb(ms, mutes))
+            self.tg.edit(chat_id, msg_id,
+                         self._panel_head(ms, mutes, self._pend()),
+                         kb=self._panel_kb(ms, mutes, self._pend()))
         except TGError:
             pass
 
