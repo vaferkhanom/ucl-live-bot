@@ -193,6 +193,127 @@ class TestFotMobFastPath(unittest.TestCase):
         self.assertEqual(len(b.tg.sent), n_before + 1, "distinct minute must not dedupe")
 
 
+class TestFantasyFixes(unittest.TestCase):
+    """2026-09-10: '19 - N. Haykin' + 14-player 0-0 HT block."""
+    def _gk(self, saves):
+        return {"player": "N. Haikin", "pos": "G", "starter": True, "subbed_in": False,
+                "subbed_out": False,
+                "stats": {"totalGoals": 0.0, "goalAssists": 0.0, "shotsOnTarget": 0.0,
+                          "yellowCards": 0.0, "redCards": 0.0, "ownGoals": 0.0,
+                          "goalsConceded": 0.0, "saves": float(saves)}}
+
+    def test_saves_official_rule_no_19pt_gk(self):
+        import fantasy as FY
+        gk = self._gk(5)
+        ht = FY.calc(gk, final=False)
+        ft = FY.calc(gk, final=True)
+        self.assertEqual(ht, 3, f"HT: 2app + 1pt/3saves, no clean sheet yet: {ht}")
+        self.assertEqual(ft, 5, f"FT: 3 + clean sheet 2: {ft}")
+        self.assertLess(max(ht, ft), 10, "per-save scoring must never return")
+
+    def test_zero_zero_ht_block_is_empty(self):
+        import fantasy as FY
+        keys = [{"type": "Kickoff", "minute": "1'", "players": []}]
+        rosters = [{"team_id": "1", "entries": [self._gk(3),
+                    {"player": "Star", "pos": "F", "starter": True, "subbed_in": False,
+                     "subbed_out": False, "stats": {"totalGoals": 0.0, "goalAssists": 0.0,
+                     "shotsOnTarget": 2.0, "goalsConceded": 0.0, "saves": 0.0,
+                     "yellowCards": 0.0, "redCards": 0.0, "ownGoals": 0.0}}]}]
+        self.assertEqual(FY.points_block(rosters, key_events=keys, final=False), [],
+                         "0-0 HT must not list appearance-only players")
+
+
+class TestUefaSource(unittest.TestCase):
+    """Official UEFA API lane (endpoints verified live 2026-09-10)."""
+    BROWN_GOAL = {  # real captured event: Fenerbahce 1-1 Roma, Brown 48'
+        "id": "52e10501-83eb-4e3e-8463-b0b38ad5d607", "type": "GOAL",
+        "phase": "SECOND_HALF", "time": {"minute": 48, "second": 42},
+        "totalScore": {"home": 1, "away": 1},
+        "primaryActor": {"person": {"internationalName": "Archie Brown",
+                                    "clubId": "52692"}},
+        "secondaryActor": {"person": {"internationalName": "Mile Svilar",
+                                      "clubId": "50137"}},
+    }
+
+    def test_normalize_goal(self):
+        import uefa
+        clubs = {"52692": "home", "50137": "away"}
+        ke = uefa.normalize_event(self.BROWN_GOAL, clubs)
+        self.assertEqual(ke["type"], "goal")
+        self.assertEqual(ke["players"], ["Archie Brown"])
+        self.assertEqual(ke["team"], "home")
+        self.assertEqual(ke["minute"], "48'")
+        self.assertEqual(ke["new_score"], [1, 1])
+        self.assertTrue(ke["id"].startswith("uefa-"))
+
+    def test_official_codes_not_espn_quirks(self):
+        import uefa
+        m = {"homeTeam": {"id": "50037", "translations": {"displayTeamCode": {"EN": "BAY"}}},
+             "awayTeam": {"id": "59333", "translations": {"displayTeamCode": {"EN": "BOD"}}}}
+        codes = uefa.match_codes(m)
+        self.assertEqual(codes, {"home": "BAY", "away": "BOD"})
+        self.assertNotEqual(codes["home"], "MUN", "ESPN's Bayern abbr must never leak")
+
+    def test_abbr_patched_from_uefa(self):
+        b = make_bot()
+        mid = "999010"
+        b.matches[mid] = {"id": mid, "state": "in",
+                          "home": {"id": "111", "abbr": "MUN", "name": "Bayern Munich",
+                                   "short": "Bayern", "color": "DC0000", "score": 0},
+                          "away": {"id": "222", "abbr": "BODO", "name": "Bodo/Glimt",
+                                   "short": "Bodo/Glimt", "color": "FFCD00", "score": 0}}
+        b._patch_abbrs(mid, {"home": "BAY", "away": "BOD"})
+        comp = b.espn_comp(mid)
+        self.assertEqual(comp["home"]["abbr"], "BAY")
+        self.assertEqual(b.matches[mid]["home"]["abbr"], "BAY")
+
+    def test_uefa_goal_then_fotmob_assist_merges(self):
+        b = make_bot()
+        mid = "999011"
+        comp = {"home": {"id": "111", "abbr": "FEN", "name": "Fenerbahce", "short": "Fenerbahce",
+                         "color": "000080", "score": 0},
+                "away": {"id": "222", "abbr": "ROM", "name": "Roma", "short": "Roma",
+                         "color": "8E1F2F", "score": 0}}
+        uefa_goal = {"id": "uefa-abc", "type": "goal", "minute": "48'", "team": "home",
+                     "players": ["Archie Brown"], "text": "", "new_score": [1, 1]}
+        b.publish_event(mid, comp, uefa_goal, "goal", new=True)
+        n = len(b.tg.sent)
+        self.assertEqual(n, 1)
+        self.assertNotIn("🅰️", b.tg.sent[-1][1])
+        # FotMob catches up WITH the assist -> same message edited, not duplicated
+        fm_goal = {"id": "fm-xyz", "type": "goal", "minute": "48'", "team": "home",
+                   "players": ["Archie Brown", "Mason Greenwood"], "text": ""}
+        b.publish_event(mid, comp, fm_goal, "goal", new=True)
+        # FakeTG records edits in .sent too: exactly ONE edit, no new send
+        self.assertEqual(len(b.tg.sent), n + 1, "assist must merge into the same message")
+        self.assertIn("EDIT:", b.tg.sent[-1][1])
+        self.assertIn("🅰️ GREENWOOD", b.tg.sent[-1][1])
+        # the merged edit must keep the post-goal score (1-1, home bracketed)
+        self.assertIn("FEN [1] - 1 ROM", b.tg.sent[-1][1])
+
+    def test_uefa_live_flips_board_state(self):
+        b = make_bot()
+        mid = "999012"
+        b.matches[mid] = {"id": mid, "state": "pre", "date": "2026-09-10T18:45:00Z",
+                          "home": {"id": "111", "abbr": "BAY", "name": "Bayern Munich",
+                                   "short": "Bayern", "color": "DC0000", "score": 0},
+                          "away": {"id": "222", "abbr": "BOD", "name": "Bodo/Glimt",
+                                   "short": "Bodo", "color": "FFCD00", "score": 0}}
+        st = b.ensure_state(mid)
+        st.uefa_mid = "2049565"
+        import uefa
+        orig_status, orig_events = uefa.status_by_id, uefa.events
+        uefa.status_by_id = lambda mid_: ("LIVE", {"homeTeam": {"id": "50037"},
+                                                   "awayTeam": {"id": "59333"}})
+        uefa.events = lambda mid_: []
+        try:
+            b.uefa_tick(mid)
+        finally:
+            uefa.status_by_id, uefa.events = orig_status, orig_events
+        self.assertEqual(b.matches[mid]["state"], "in", "UEFA LIVE must trigger kickoff")
+        self.assertEqual(st.next_poll, 0.0, "ESPN lane must poll immediately")
+
+
 class TestFindIds(unittest.IsolatedAsyncioTestCase):
     def _fetch_ok(self):
         try:

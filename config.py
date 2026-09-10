@@ -5,8 +5,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
 
 # ---- optional tuning ----
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))          # live match poll interval
-SCOREBOARD_SECONDS = int(os.environ.get("SCOREBOARD_SECONDS", "90"))  # fixture discovery interval
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "5"))           # ESPN poll interval
+FM_POLL_SECONDS = int(os.environ.get("FM_POLL_SECONDS", "2"))     # FotMob fast-lane interval
+UEFA_POLL_SECONDS = int(os.environ.get("UEFA_POLL_SECONDS", "3")) # UEFA official lane interval
+SCOREBOARD_SECONDS = int(os.environ.get("SCOREBOARD_SECONDS", "60"))  # fixture discovery interval
 # Railway: use persistent volume at /data when mounted, else local file.
 # Set DB_PATH explicitly to override (e.g. DB_PATH=/data/data.db with a volume at /data).
 def _default_db():
@@ -33,7 +35,8 @@ POINTS = {
     "goal": 4,        # all positions
     "assist": 2,
     "sot": 1,
-    "saves": 3,       # GK
+    # Official UCL Fantasy: every 3 saves = 1 pt (GK). NOT per-save.
+    "saves_per3": 1,
     "conceded_per2": -1,  # GK/DEF, per 2 goals conceded
     "yellow": -1,
     "red": -3,

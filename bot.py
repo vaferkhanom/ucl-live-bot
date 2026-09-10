@@ -15,12 +15,13 @@ import traceback
 
 from config import (BOT_TOKEN, OWNER_ID, LEAGUE_SLUG, POLL_SECONDS,
                     SCOREBOARD_SECONDS, DB_PATH, SHOW_STATS_BLOCK, SHOW_LINEUPS,
-                    FANTASY, POINTS_LIST_MAX, KICKOFF_MSG)
+                    FANTASY, POINTS_LIST_MAX, KICKOFF_MSG, FM_POLL_SECONDS,
+                    UEFA_POLL_SECONDS)
 from tg import TG, TGError
 from store import Store
 import espn
-import scores365
 import fotmob
+import uefa
 import formatter as F
 import fantasy as FY
 
@@ -44,11 +45,15 @@ class MatchState:
         self.disallowed = set()      # event_keys already edited/flagged disallowed
         self.last_summary = None
         self.pre_checks = 0
-        self.watch_fp = ""          # 365scores fingerprint (watchdog)
+        self.uefa_next = 0.0         # UEFA events poll throttle
         self.fm_ids = []            # candidate FotMob match ids for this match
         self.fm_seen = set()        # fotmob event keys already handled
         self.fm_sig = {}            # fotmob event key -> sig (revision detect)
-        self.seen_ev = {}           # (kind, minute, player) -> event_key (cross-source dedupe)
+        self.uefa_mid = None        # resolved official UEFA match id
+        self.uefa_codes = None      # {'home': 'BAY', 'away': 'BOD'}
+        self.uefa_seen = set()      # uefa event keys already handled
+        self.seen_ev = {}           # (kind, probe) -> (minute_int, ev_key, has_assist)
+        self.goal_scores = {}       # ev_key -> (home, away) score used at publish
 
 
 
@@ -59,6 +64,7 @@ class Bot:
         self.matches = {}
         self.state = {}
         self.lock = threading.Lock()
+        self.pub_lock = threading.RLock()   # serializes event processing/publishing
         self.owner = OWNER_ID
         self.started = time.time()
         self.last_board = 0
@@ -331,7 +337,7 @@ class Bot:
                 self.publish(F.render_ko(comp), f"{mid}|status-ko", mid)
             if at_ht and "ht" not in st.statuses:
                 st.statuses.add("ht")
-                pts = self.points_lines(s) if FANTASY else None
+                pts = self.points_lines(s, final=False) if FANTASY else None
                 self.publish(F.render_ht(comp, pts), f"{mid}|status-ht", mid)
             elif not at_ht and "ht" in st.statuses and \
                     "second_half" not in st.statuses and "ko" in st.statuses:
@@ -388,7 +394,7 @@ class Bot:
         if kind == "ht":
             if "ht" not in st.statuses:
                 st.statuses.add("ht")
-                pts = self.points_lines(st.last_summary) if FANTASY else None
+                pts = self.points_lines(st.last_summary, final=False) if FANTASY else None
                 self.publish(F.render_ht(comp, pts), f"{mid}|status-ht", mid)
             return
         if kind == "second_half":
@@ -421,6 +427,10 @@ class Bot:
         return f"{mid}|{prefix}-{kid}" if prefix else None
 
     def publish_event(self, mid, comp, ke, kind, new=True):
+        with self.pub_lock:
+            self._publish_event_locked(mid, comp, ke, kind, new)
+
+    def _publish_event_locked(self, mid, comp, ke, kind, new=True):
         st = self.ensure_state(mid)
         minute = F.norm_minute(ke.get("minute"))
         players = ke.get("players") or []
@@ -434,17 +444,29 @@ class Bot:
                 team_id = str(cid)
                 emoji_side, _ = F.team_side_emoji(comp, team_id)
         text_l = (ke.get("text") or "").lower()
-        # ---- cross-source dedupe: ESPN replays what FotMob already sent ----
+        # ---- cross-source dedupe: UEFA/FotMob/ESPN race the same events ----
         # names differ across sources (Matias/Matías) and stoppage minutes are
         # notated differently (90+2 vs 92): accent-fold the player and allow
         # +/-2 min once stoppage time is in play.
         probe = (kind, self._probe_key(players[0] if players else ""))
         m_int = FY.minute_value(minute)
         if new and kind != "pen_awarded":
-            for (k2, p2), (m2, _ek) in st.seen_ev.items():
-                if k2 == kind and p2 == probe[1] and \
-                        m_int is not None and m2 is not None and \
-                        abs(m_int - m2) <= (2 if max(m_int, m2) >= 45 else 0):
+            hit = st.seen_ev.get(probe)
+            if hit:
+                m2, ek2, has_ast = hit
+                tol = 2 if max(m_int or 0, m2 or 0) >= 45 else 0
+                if m_int is not None and m2 is not None and abs(m_int - m2) <= tol:
+                    # goal published fast by another source: if THIS source now
+                    # carries the assist, complete the same message in place.
+                    if kind in ("goal", "own_goal") and len(players) > 1 and not has_ast:
+                        scorer = F.event_lastname_upper(players[0])
+                        assist = F.display_name(players[1])
+                        rcomp = self._scored_comp(st, comp, ke, ek2)
+                        txt = F.render_goal(rcomp, side or "home", scorer, assist,
+                                            minute, penalty="penalty" in text_l,
+                                            own_goal=(kind == "own_goal"))
+                        st.seen_ev[probe] = (m2, ek2, True)
+                        self.edit_event(ek2, txt)
                     return
 
         if kind in ("goal", "own_goal"):
@@ -459,22 +481,28 @@ class Bot:
                         side = ha
                         break
                 side = side or "home"
-            # FotMob knows the exact post-goal score — never render a stale one
-            rcomp = comp
-            ns = ke.get("new_score")
-            if ns and (comp.get("home") and comp.get("away")):
-                rcomp = {k: dict(v) for k, v in comp.items()}
-                rcomp["home"]["score"] = int(ns[0])
-                rcomp["away"]["score"] = int(ns[1])
             ev_key = self.event_key(mid, ke, kind)
+            rcomp = self._scored_comp(st, comp, ke, ev_key)
             txt = F.render_goal(rcomp, side, scorer, assist, minute,
                                 penalty=is_pen, own_goal=(kind == "own_goal"))
             if new:
-                st.seen_ev[probe] = (m_int, ev_key)
+                st.seen_ev[probe] = (m_int, ev_key, bool(assist))
+                st.goal_scores[ev_key] = (rcomp["home"]["score"], rcomp["away"]["score"])
                 st.goal_msgs.append((str(ke.get("id")), side, ev_key))
                 self.publish(txt, ev_key, mid)
             else:
-                self.edit_event(ev_key, txt)
+                # revision (assist added): if another source published this
+                # message first, edit THEIR message instead of a dead key.
+                target = ev_key
+                if not self.store.msgs(ev_key):
+                    hit = st.seen_ev.get(probe)
+                    if hit:
+                        target = hit[1]
+                        st.seen_ev[probe] = (hit[0], hit[1], True)
+                rcomp = self._scored_comp(st, comp, ke, target)
+                txt = F.render_goal(rcomp, side, scorer, assist, minute,
+                                    penalty=is_pen, own_goal=(kind == "own_goal"))
+                self.edit_event(target, txt)
             return
 
         if kind == "disallowed":
@@ -489,7 +517,7 @@ class Bot:
             ev_key = self.event_key(mid, ke, kind)
             txt = F.render_card(comp, team_id, p, kind, minute)
             if new:
-                st.seen_ev[probe] = (m_int, ev_key)
+                st.seen_ev[probe] = (m_int, ev_key, False)
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
@@ -515,11 +543,29 @@ class Bot:
             txt = F.render_sub(comp, team_id, pin, pout, minute)
             ev_key = self.event_key(mid, ke, kind)
             if new:
-                st.seen_ev[probe] = (m_int, ev_key)
+                st.seen_ev[probe] = (m_int, ev_key, False)
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
             return
+
+    # ---------------- helpers ----------------
+    def _scored_comp(self, st, comp, ke, ev_key=None):
+        """Post-event score for rendering: sources that know the exact score
+        (FotMob newScore / UEFA totalScore) win; on edits, the score already
+        shown wins; a stale ESPN comp must never regress a message."""
+        hs = as_ = None
+        ns = ke.get("new_score")
+        if ns:
+            hs, as_ = int(ns[0]), int(ns[1])
+        elif ev_key and ev_key in st.goal_scores:
+            hs, as_ = st.goal_scores[ev_key]
+        if hs is None or not (comp.get("home") and comp.get("away")):
+            return comp
+        rcomp = {k: dict(v) for k, v in comp.items()}
+        rcomp["home"]["score"] = hs
+        rcomp["away"]["score"] = as_
+        return rcomp
 
     # ---------------- statuses & FT ----------------
     def do_ft(self, mid, comp, s=None):
@@ -549,14 +595,18 @@ class Bot:
         lines = [f"{n} - {F.fmt_name(p)}" for p, n in sorted(tallies.items(), key=lambda x: -x[1])]
         return lines or None
 
-    def points_lines(self, s):
+    def points_lines(self, s, final=True):
         if not s:
             return None
         return FY.points_block(s.get("rosters") or [], max_lines=POINTS_LIST_MAX,
-                               key_events=s.get("keyEvents")) or None
+                               key_events=s.get("keyEvents"), final=final) or None
 
     # ---------------- disallowed detection ----------------
     def check_scores(self, mid, comp, s):
+        with self.pub_lock:
+            self._check_scores_locked(mid, comp, s)
+
+    def _check_scores_locked(self, mid, comp, s):
         st = self.ensure_state(mid)
         hs = (comp.get("home") or {}).get("score", st.scores[0])
         as_ = (comp.get("away") or {}).get("score", st.scores[1])
@@ -578,8 +628,10 @@ class Bot:
                 players = ke.get("players") or []
                 scorer = F.event_lastname_upper(players[0]) if players else "?"
                 assist = F.display_name(players[1]) if len(players) > 1 else None
-                txt = F.render_goal(comp, side, scorer, assist, ke.get("minute") or "",
+                rcomp = self._scored_comp(st, comp, ke, ev_key)
+                txt = F.render_goal(rcomp, side, scorer, assist, ke.get("minute") or "",
                                     penalty="penalty" in (ke.get("text") or "").lower())
+                st.goal_scores[ev_key] = (rcomp["home"]["score"], rcomp["away"]["score"])
                 self.edit_event(ev_key, txt)
             return
 
@@ -624,9 +676,71 @@ class Bot:
             except TGError as e:
                 print(f"[edit fail {chat_id}] {e}", flush=True)
 
-    # ---------------- watchdog (365scores) ----------------
-    def _norm(self, s):
-        return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+    # ---------------- lanes (concurrency model) ----------------
+    # board_loop: scoreboard + pre-match lineups + id pre-resolution (60s)
+    # fast_loop : UEFA official + FotMob fast event publishing (2-3s, detects
+    #             kickoff from the source itself, NOT from the board)
+    # espn_loop : ESPN keyEvents/statuses/stats fallback (POLL_SECONDS)
+    # panel_loop: admin panel auto-refresh
+    # Network fetches happen OUTSIDE pub_lock; all event processing and TG
+    # publishing happens INSIDE pub_lock (serialized, no interleaved edits).
+
+    def fast_loop(self):
+        while True:
+            time.sleep(FM_POLL_SECONDS)
+            try:
+                with self.lock:
+                    snapshot = list(self.matches.keys())
+                for mid in snapshot:
+                    try:
+                        self.uefa_tick(mid)
+                    except Exception:  # noqa: BLE001
+                        traceback.print_exc()
+                    m = self.matches.get(mid) or {}
+                    if m.get("state") == "in":
+                        try:
+                            self.fm_tick(mid, (m.get("home") or {}).get("name"),
+                                         (m.get("away") or {}).get("name"))
+                        except Exception:  # noqa: BLE001
+                            traceback.print_exc()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    def espn_loop(self):
+        while True:
+            time.sleep(2)
+            try:
+                now = time.time()
+                with self.lock:
+                    snapshot = [(mid, m.get("state")) for mid, m in self.matches.items()]
+                for mid, state in snapshot:
+                    if state == "in":
+                        st = self.ensure_state(mid)
+                        if now >= st.next_poll:
+                            st.next_poll = now + POLL_SECONDS
+                            self.poll_match(mid)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    def board_loop(self):
+        self.refresh_board()
+        while True:
+            try:
+                now = time.time()
+                if now - self.last_board >= SCOREBOARD_SECONDS:
+                    self.refresh_board()
+                with self.lock:
+                    snapshot = [(mid, m.get("state")) for mid, m in self.matches.items()]
+                for mid, state in snapshot:
+                    if state == "pre":
+                        st = self.ensure_state(mid)
+                        if st.next_poll <= now and (st.pre_checks < 1 or now - st.next_poll > 0):
+                            st.pre_checks += 1
+                            st.next_poll = now + 1800
+                            self.pre_match_check(mid)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+            time.sleep(5)
 
     def _probe_key(self, s):
         """Accent-folded key for cross-source player dedupe (Matias == Matías)."""
@@ -635,51 +749,8 @@ class Bot:
         n = "".join(ch for ch in n if not _ud.combining(ch))
         return re.sub(r"[^a-z0-9 ]", "", n.lower()).strip()
 
-    def watch_tick(self):
-        """Cheap 365scores check (~30KB). On any clock/score/status change for a
-        match we track, force an immediate ESPN poll of that match. Also fires
-        FotMob fast-poll for live matches (main event publisher)."""
-        with self.lock:
-            any_live = any(m.get("state") == "in" for m in self.matches.values())
-        if not any_live:
-            return
-        try:
-            live = scores365.live_ucl()
-        except Exception as e:  # noqa: BLE001
-            print("watchdog fail:", e, flush=True)
-            live = {}
-        with self.lock:
-            tracked = [(mid, (m.get("home") or {}).get("name"), (m.get("away") or {}).get("name"))
-                       for mid, m in self.matches.items()]
-        for mid, hname, aname in tracked:
-            st = self.ensure_state(mid)
-            with self.lock:
-                mstate = self.matches.get(mid, {}).get("state")
-            if mstate != "in":
-                continue
-            hn, an = self._norm(hname), self._norm(aname)
-            if not hn or not an:
-                continue
-            row = next((r for r in live.values()
-                        if (hn in r["home"] or r["home"] in hn)
-                        and (an in r["away"] or r["away"] in an)), None)
-            if row:
-                fp = scores365.fingerprint(row)
-                if fp != st.watch_fp:
-                    changed = bool(st.watch_fp)
-                    st.watch_fp = fp
-                    # score/status change → poll right now; clock-only → within POLL_SECONDS
-                    if changed:
-                        st.next_poll = 0.0
-            # FotMob fast path: publish events from FotMob (~70s faster than 365)
-            try:
-                self.fm_tick(mid, hname, aname)
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-
-    # ---------------- FotMob fast publisher ----------------
     def fm_resolve(self, mid, hname, aname):
-        """Find FotMob id(s) matching this match (cached once found)."""
+        """Find the FotMob id matching this match (cached once found)."""
         st = self.ensure_state(mid)
         if st.fm_ids:
             return st.fm_ids
@@ -729,35 +800,73 @@ class Bot:
             # minimal fallback so renderers never crash before first ESPN poll
             m = self.matches.get(mid) or {}
             comp = {"home": dict(m.get("home") or {}), "away": dict(m.get("away") or {})}
+        # official UEFA team codes override ESPN's quirks (ESPN abbreviates
+        # Bayern as 'MUN' — reads as Man Utd and confuses everyone)
+        codes = st.uefa_codes or {}
+        for side in ("home", "away"):
+            code = codes.get(side)
+            if code and comp.get(side):
+                comp[side]["abbr"] = code
         return comp
 
+    def _patch_abbrs(self, mid, codes):
+        """Apply official UEFA displayTeamCode to the board match dict too."""
+        with self.lock:
+            m = self.matches.get(mid) or {}
+            for side in ("home", "away"):
+                code = codes.get(side)
+                if code and m.get(side):
+                    m[side]["abbr"] = code
 
-    # ---------------- tracker thread ----------------
-    def tracker(self):
-        self.refresh_board()
-        while True:
-            try:
-                if time.time() - self.last_board >= SCOREBOARD_SECONDS:
-                    self.refresh_board()
-                self.watch_tick()
-                now = time.time()
-                with self.lock:
-                    snapshot = [(mid, m.get("state")) for mid, m in self.matches.items()]
-                for mid, state in snapshot:
-                    st = self.ensure_state(mid)
-                    if state == "in":
-                        if now >= st.next_poll:
-                            st.next_poll = now + POLL_SECONDS
-                            self.poll_match(mid)
-                    elif state == "pre":
-                        # one immediate check + hourly lineup check
-                        if st.next_poll <= now and (st.pre_checks < 1 or now - st.next_poll > 0):
-                            st.pre_checks += 1
-                            st.next_poll = now + 1800
-                            self.pre_match_check(mid)
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-            time.sleep(2)
+    # ---------------- UEFA official lane ----------------
+    def uefa_tick(self, mid):
+        """Poll the official UEFA API for events (fastest + authoritative).
+
+        Also detects kickoff (status LIVE) earlier than the scoreboard and
+        resolves the match's official team codes."""
+        st = self.ensure_state(mid)
+        m = self.matches.get(mid) or {}
+        if not st.uefa_mid:
+            um = uefa.resolve_match((m.get("home") or {}).get("name"),
+                                    (m.get("away") or {}).get("name"), m.get("date"))
+            if um:
+                st.uefa_mid = str(um.get("id"))
+                codes = uefa.match_codes(um)
+                if all(codes.values()):
+                    st.uefa_codes = codes
+                    self._patch_abbrs(mid, codes)
+            return   # events start next tick
+        status, um = uefa.status_by_id(st.uefa_mid)
+        if status == "LIVE" and m.get("state") != "in":
+            # kickoff detected by the official source — start everything now
+            with self.lock:
+                if mid in self.matches:
+                    self.matches[mid]["state"] = "in"
+            st.next_poll = 0.0
+        if status not in ("LIVE", "FINISHED"):
+            return
+        now = time.time()
+        if now < st.uefa_next:
+            return
+        st.uefa_next = now + UEFA_POLL_SECONDS
+        clubs = uefa.club_map(um) if um else {}
+        try:
+            evs = uefa.events(st.uefa_mid)
+        except Exception:
+            return
+        comp = self.espn_comp(mid)
+        for e in evs:
+            ke = uefa.normalize_event(e, clubs)
+            if not ke:
+                continue
+            key = str(ke.get("id"))
+            if key in st.uefa_seen:
+                continue
+            st.uefa_seen.add(key)
+            kind = self.classify(ke)
+            if kind in ("goal", "own_goal", "yellow", "red", "second_yellow"):
+                self.publish_event(mid, comp, ke, kind, new=True)
+
 
     # ---------------- commands ----------------
     def cmd_today(self, chat_id):
@@ -931,7 +1040,9 @@ class Bot:
         self._panel_reedit(chat_id, msg_id)
 
     def run(self):
-        threading.Thread(target=self.tracker, daemon=True).start()
+        threading.Thread(target=self.board_loop, daemon=True).start()
+        threading.Thread(target=self.fast_loop, daemon=True).start()
+        threading.Thread(target=self.espn_loop, daemon=True).start()
         threading.Thread(target=self.panel_loop, daemon=True).start()
         print("UCL Live Bot started.", flush=True)
         while True:
