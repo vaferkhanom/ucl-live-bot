@@ -62,6 +62,7 @@ class Bot:
         self.owner = OWNER_ID
         self.started = time.time()
         self.last_board = 0
+        self._panel_fp = None
         if not self.owner:
             self.owner = int(self.store.kv_get("owner") or 0)
 
@@ -80,6 +81,76 @@ class Bot:
     def groups(self):
         return self.store.groups()
 
+    # ---------------- admin panel ----------------
+    PANEL_MAX_ROWS = 12
+
+    def panel_row(self, m, mutes):
+        """One panel button: '96' FER v ROM 2-4 90' 🔇/🔴/⏳"""
+        h, a = m.get("home") or {}, m.get("away") or {}
+        mid = str(m["id"])
+        muted = "🔇 " if mid in mutes else ""
+        if m.get("state") == "in":
+            st_emoji = "🔴"
+            score = f" {h.get('score', 0)}-{a.get('score', 0)}"
+            detail = str(m.get("detail") or "")
+            clock = f" {detail}" if detail and detail.upper() not in ("IN PLAY",) else ""
+
+        elif m.get("state") == "post":
+            st_emoji = "✅"
+            score = f" {h.get('score', 0)}-{a.get('score', 0)}"
+            clock = ""
+        else:
+            st_emoji = "⏳"
+            score, clock = "", ""
+        when = ""
+        try:
+            dt = datetime.datetime.fromisoformat((m.get("date") or "").replace("Z", "+00:00"))
+            when = (dt + datetime.timedelta(seconds=12600)).strftime("%H:%M")
+        except Exception:  # noqa: BLE001
+            pass
+        label = (f"{st_emoji}{muted} {h.get('abbr')} v {a.get('abbr')}"
+                 f"{score}{clock} · {when}")
+        action = "unmute" if mid in mutes else "pmute"
+        return [{"text": label, "callback_data": f"{action}:{mid}"}]
+
+    def cmd_panel(self, chat_id):
+        """One-tap admin panel: every match = one glass button. Always current:
+        refresh_board() prunes finished/yesterday matches (grace for live FT)."""
+        self.refresh_board()
+        with self.lock:
+            ms = sorted(self.matches.values(), key=lambda m: m.get("date") or "")
+        mutes = self.store.mutes()
+        btns = [self.panel_row(m, mutes) for m in ms[: self.PANEL_MAX_ROWS]]
+        if not btns:
+            self.tg.send(chat_id, "🎮 <b>پنل ادمین</b>\n\nالان هیچ بازی‌ای نیست — "
+                                  "به‌محض اینکه برنامه چمپیونزلیگ اعلام بشه خودش اینجا میاد.")
+            return
+        live = sum(1 for m in ms if m.get("state") == "in")
+        muted_n = len(mutes)
+        head = (f"🎮 <b>پنل ادمین</b> — {len(ms)} بازی"
+                f" | 🔴 {live} لایو | 🔇 {muted_n} موت\n"
+                f"تاریخ: {datetime.datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')} تهران\n"
+                "<i>کلیک = قطع/وصل نوتیف همون بازی</i>")
+        kb = {"inline_keyboard": btns + [
+            [{"text": "🔇 موت همهٔ امروز", "callback_data": "pmute:all"},
+             {"text": "🔊 وصل همه", "callback_data": "punmute:all"}],
+            [{"text": "🔄 رفرش", "callback_data": "prefresh"},
+             {"text": "❌ بستن", "callback_data": "close"}],
+        ]}
+        msg = self.tg.send(chat_id, head, kb=kb)
+        if msg and msg.get("message_id"):
+            self.store.kv_set("panel_msg", f"{chat_id}:{msg['message_id']}")
+            self._panel_fp = None   # force next push to re-sync
+
+    def _panel_kb(self, ms, mutes):
+        btns = [self.panel_row(m, mutes) for m in ms[: self.PANEL_MAX_ROWS]]
+        return {"inline_keyboard": btns + [
+            [{"text": "🔇 موت همهٔ امروز", "callback_data": "pmute:all"},
+             {"text": "🔊 وصل همه", "callback_data": "punmute:all"}],
+            [{"text": "🔄 رفرش", "callback_data": "prefresh"},
+             {"text": "❌ بستن", "callback_data": "close"}],
+        ]}
+
     # ---------------- scoreboard ----------------
     def refresh_board(self):
         now = datetime.datetime.now(TEHRAN).date()
@@ -91,8 +162,24 @@ class Bot:
             print("scoreboard fail:", e, flush=True)
             return
         with self.lock:
+            fresh = set()
             for m in fx:
+                m["_seen"] = time.time()
+                fresh.add(m["id"])
                 self.matches[m["id"]] = m
+            if fx:
+                # daily rollover: drop yesterday's/finished matches so the panel
+                # only ever shows today+tomorrow; give live games a grace window
+                # so their FT message still lands before removal.
+                for mid in list(self.matches):
+                    if mid in fresh:
+                        continue
+                    st = self.state.get(mid)
+                    if st and st.live and \
+                       time.time() - self.matches[mid].get("_seen", 0) < 1200:
+                        continue
+                    self.store.unmute(mid)   # stale mute rows die with the match
+                    self.matches.pop(mid, None)
         self.last_board = time.time()
 
     def today_rows(self):
@@ -723,6 +810,8 @@ class Bot:
             return
         if cmd in ("/start", "/help"):
             self.cmd_help(chat_id)
+        elif cmd == "/panel" and ctype == "private" and self.is_owner(uid):
+            self.cmd_panel(chat_id)
         elif cmd == "/today":
             self.cmd_today(chat_id)
         elif cmd == "/mute":
@@ -751,31 +840,98 @@ class Bot:
             except TGError:
                 pass
             return
-        if data.startswith("mute:"):
+        if data.startswith("mute:") or data.startswith("pmute:"):
             mid = data.split(":", 1)[1]
+            if mid == "all":
+                n = 0
+                with self.lock:
+                    ms = [m for m in self.matches.values() if m.get("state") != "post"]
+                for m in ms:
+                    h, a = m.get("home") or {}, m.get("away") or {}
+                    self.store.mute(str(m["id"]), f"{h.get('abbr')} vs {a.get('abbr')}")
+                    n += 1
+                self.tg.answer_callback(cb.get("id"), f"🔇 {n} بازی موت شد")
+                self._panel_reedit(chat_id, msg_id)
+                return
             m = self.matches.get(mid) or {}
             h, a = m.get("home") or {}, m.get("away") or {}
             label = f"{h.get('abbr')} vs {a.get('abbr')}"
             self.store.mute(mid, label)
             self.tg.answer_callback(cb.get("id"), f"🔇 {label} موت شد")
-            try:
-                kb = ((cb.get("message") or {}).get("reply_markup") or {}).get("inline_keyboard") or []
-                new_kb = [row for row in kb if not any(b.get("callback_data") == f"mute:{mid}" for b in row)]
-                if not new_kb:
-                    self.tg.api("deleteMessage", chat_id=chat_id, message_id=msg_id)
-                else:
-                    self.tg.api("editMessageReplyMarkup", chat_id=chat_id, message_id=msg_id,
-                                reply_markup={"inline_keyboard": new_kb})
-            except TGError:
-                pass
-        elif data.startswith("unmute:"):
+            self._panel_reedit(chat_id, msg_id)
+        elif data.startswith("unmute:") or data.startswith("punmute:"):
             mid = data.split(":", 1)[1]
-            self.store.unmute(mid)
-            self.tg.answer_callback(cb.get("id"), "🔊 وصل شد")
+            if mid == "all":
+                self.store.unmute_all()
+                self.tg.answer_callback(cb.get("id"), "🔊 همه وصل شدن")
+            else:
+                self.store.unmute(mid)
+                self.tg.answer_callback(cb.get("id"), "🔊 وصل شد")
+            self._panel_reedit(chat_id, msg_id)
+        elif data == "prefresh":
+            self._panel_reedit(chat_id, msg_id)
+            self.tg.answer_callback(cb.get("id"), "🔄 اورات به‌روز شد")
+
+    def _panel_reedit(self, chat_id, msg_id, alert=False):
+        """Re-render panel buttons in place (fresh minutes/scores/new day)."""
+        try:
+            self.refresh_board()
+            with self.lock:
+                ms = sorted(self.matches.values(), key=lambda m: m.get("date") or "")
+            mutes = self.store.mutes()
+            if not ms:
+                return
+            live = sum(1 for m in ms if m.get("state") == "in")
+            head = (f"🎮 <b>پنل ادمین</b> — {len(ms)} بازی"
+                    f" | 🔴 {live} لایو | 🔇 {len(mutes)} موت\n"
+                    f"تاریخ: {datetime.datetime.now(TEHRAN).strftime('%Y-%m-%d %H:%M')} تهران\n"
+                    "<i>کلیک = قطع/وصل نوتیف همون بازی</i>")
+            self.tg.edit(chat_id, msg_id, head, kb=self._panel_kb(ms, mutes))
+        except TGError:
+            pass
 
     # ---------------- main ----------------
+    def panel_loop(self):
+        """Live panel: every 60s push fresh minutes/scores into the pinned
+        panel; at Tehran midnight the board refresh prunes yesterday and the
+        panel re-renders — zero maintenance forever."""
+        last_minute_push = 0
+        last_day = datetime.datetime.now(TEHRAN).date()
+        while True:
+            time.sleep(10)
+            try:
+                now = time.time()
+                today = datetime.datetime.now(TEHRAN).date()
+                if today != last_day:
+                    last_day = today
+                    self.refresh_board()
+                    self._push_panel(force=True)
+                    continue
+                if now - last_minute_push >= 60:
+                    last_minute_push = now
+                    self._push_panel()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    def _push_panel(self, force=False):
+        pid = self.store.kv_get("panel_msg")
+        if not pid:
+            return
+        chat_id, msg_id = pid.split(":", 1)
+        chat_id, msg_id = int(chat_id), int(msg_id)
+        # only bump text when something actually moved (or forced: new day)
+        with self.lock:
+            fp = "|".join(sorted(
+                f"{m['id']}:{m.get('state')}:{(m.get('home') or {}).get('score')}:"
+                f"{(m.get('away') or {}).get('score')}" for m in self.matches.values()))
+        if not force and fp == self._panel_fp:
+            return
+        self._panel_fp = fp
+        self._panel_reedit(chat_id, msg_id)
+
     def run(self):
         threading.Thread(target=self.tracker, daemon=True).start()
+        threading.Thread(target=self.panel_loop, daemon=True).start()
         print("UCL Live Bot started.", flush=True)
         while True:
             try:

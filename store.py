@@ -47,6 +47,10 @@ class Store:
         with self.lock, self._conn() as c:
             c.execute("DELETE FROM mutes WHERE match_id=?", (str(match_id),))
 
+    def unmute_all(self):
+        with self.lock, self._conn() as c:
+            c.execute("DELETE FROM mutes")
+
     def mutes(self):
         with self.lock, self._conn() as c:
             return {str(r[0]): r[1] for r in c.execute("SELECT match_id,label FROM mutes")}
