@@ -20,6 +20,7 @@ from tg import TG, TGError
 from store import Store
 import espn
 import scores365
+import fotmob
 import formatter as F
 import fantasy as FY
 
@@ -44,6 +45,11 @@ class MatchState:
         self.last_summary = None
         self.pre_checks = 0
         self.watch_fp = ""          # 365scores fingerprint (watchdog)
+        self.fm_ids = []            # candidate FotMob match ids for this match
+        self.fm_seen = set()        # fotmob event keys already handled
+        self.fm_sig = {}            # fotmob event key -> sig (revision detect)
+        self.seen_ev = {}           # (kind, minute, player) -> event_key (cross-source dedupe)
+
 
 
 class Bot:
@@ -297,10 +303,16 @@ class Bot:
         st = self.ensure_state(mid)
         minute = F.norm_minute(ke.get("minute"))
         players = ke.get("players") or []
-        team_id = ke.get("team_id") or ""
+        team_id = ke.get("team_id") or ke.get("team") or ""
         side, _ = None, None
         emoji_side, side = F.team_side_emoji(comp, team_id)
+        if not side and ke.get("team") in ("home", "away"):
+            side = ke.get("team")   # FotMob events carry 'home'/'away' directly
         text_l = (ke.get("text") or "").lower()
+        # ---- cross-source dedupe: ESPN replays what FotMob already sent ----
+        dup_probe = (kind, str(minute), (players[0] if players else "").lower())
+        if new and kind not in ("pen_awarded",) and dup_probe in st.seen_ev:
+            return
 
         if kind in ("goal", "own_goal"):
             scorer = F.event_lastname_upper(players[0]) if players else "?"
@@ -318,6 +330,7 @@ class Bot:
             txt = F.render_goal(comp, side, scorer, assist, minute,
                                 penalty=is_pen, own_goal=(kind == "own_goal"))
             if new:
+                st.seen_ev[dup_probe] = ev_key
                 st.goal_msgs.append((str(ke.get("id")), side, ev_key))
                 self.publish(txt, ev_key, mid)
             else:
@@ -336,6 +349,7 @@ class Bot:
             ev_key = self.event_key(mid, ke, kind)
             txt = F.render_card(comp, team_id, p, kind, minute)
             if new:
+                st.seen_ev[dup_probe] = ev_key
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
@@ -356,11 +370,12 @@ class Bot:
         if kind == "sub":
             pin = pout = "?"
             if len(players) >= 2:
-                # ESPN lists participants as [IN, OUT] ('X replaces Y')
+                # ESPN lists participants as [IN, OUT] ('X replaces Y'); FotMob swap is same order
                 pin, pout = players[0], players[1]
             txt = F.render_sub(comp, team_id, pin, pout, minute)
             ev_key = self.event_key(mid, ke, kind)
             if new:
+                st.seen_ev[dup_probe] = ev_key
                 self.publish(txt, ev_key, mid)
             else:
                 self.edit_event(ev_key, txt)
@@ -476,7 +491,8 @@ class Bot:
 
     def watch_tick(self):
         """Cheap 365scores check (~30KB). On any clock/score/status change for a
-        match we track, force an immediate ESPN poll of that match."""
+        match we track, force an immediate ESPN poll of that match. Also fires
+        FotMob fast-poll for live matches (main event publisher)."""
         with self.lock:
             any_live = any(m.get("state") == "in" for m in self.matches.values())
         if not any_live:
@@ -485,7 +501,7 @@ class Bot:
             live = scores365.live_ucl()
         except Exception as e:  # noqa: BLE001
             print("watchdog fail:", e, flush=True)
-            return
+            live = {}
         with self.lock:
             tracked = [(mid, (m.get("home") or {}).get("name"), (m.get("away") or {}).get("name"))
                        for mid, m in self.matches.items()]
@@ -501,15 +517,74 @@ class Bot:
             row = next((r for r in live.values()
                         if (hn in r["home"] or r["home"] in hn)
                         and (an in r["away"] or r["away"] in an)), None)
-            if not row:
+            if row:
+                fp = scores365.fingerprint(row)
+                if fp != st.watch_fp:
+                    changed = bool(st.watch_fp)
+                    st.watch_fp = fp
+                    # score/status change → poll right now; clock-only → within POLL_SECONDS
+                    if changed:
+                        st.next_poll = 0.0
+            # FotMob fast path: publish events from FotMob (~70s faster than 365)
+            try:
+                self.fm_tick(mid, hname, aname)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+
+    # ---------------- FotMob fast publisher ----------------
+    def fm_resolve(self, mid, hname, aname):
+        """Find FotMob id(s) matching this match (cached once found)."""
+        st = self.ensure_state(mid)
+        if st.fm_ids:
+            return st.fm_ids
+        try:
+            ids = fotmob.find_ids(hname, aname)
+        except Exception:
+            ids = []
+        if ids:
+            st.fm_ids = ids
+        return ids
+
+    def fm_tick(self, mid, hname, aname):
+        """Poll FotMob matchDetails; publish new events before ESPN does."""
+        st = self.ensure_state(mid)
+        for fmid in self.fm_resolve(mid, hname, aname):
+            f, changed = fotmob.match_changed(fmid)
+            if not f:
                 continue
-            fp = scores365.fingerprint(row)
-            if fp != st.watch_fp:
-                changed = bool(st.watch_fp)
-                st.watch_fp = fp
-                # score/status change → poll right now; clock-only → within POLL_SECONDS
-                if changed:
-                    st.next_poll = 0.0
+            stt = fotmob.status(f)
+            if stt["cancelled"] or (not stt["started"]):
+                continue
+            kevs = fotmob.normalize_events(f)
+            comp = self.espn_comp(mid)
+            for ke in kevs:
+                key = str(ke.get("id"))
+                sig = self.event_sig(ke)
+                if key not in st.fm_seen:
+                    st.fm_seen.add(key)
+                    st.fm_sig[key] = sig
+                    kind = self.classify(ke)
+                    if kind in ("goal", "own_goal", "yellow", "red", "second_yellow",
+                                "pen_missed", "pen_saved", "pen_awarded", "sub",
+                                "disallowed"):
+                        self.publish_event(mid, comp, ke, kind, new=True)
+                elif st.fm_sig.get(key) != sig:
+                    st.fm_sig[key] = sig
+                    kind = self.classify(ke)
+                    if kind:
+                        self.handle_revision(mid, comp, ke)
+
+    def espn_comp(self, mid):
+        """Last known ESPN competitors dict for this match (for renderers)."""
+        st = self.ensure_state(mid)
+        s = st.last_summary or {}
+        comp = s.get("competitors") or {}
+        if not comp.get("home"):
+            # minimal fallback so renderers never crash before first ESPN poll
+            m = self.matches.get(mid) or {}
+            comp = {"home": dict(m.get("home") or {}), "away": dict(m.get("away") or {})}
+        return comp
+
 
     # ---------------- tracker thread ----------------
     def tracker(self):
