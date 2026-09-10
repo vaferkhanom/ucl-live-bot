@@ -725,76 +725,12 @@ class Bot:
             time.sleep(2)
 
     # ---------------- commands ----------------
-    def cmd_help(self, chat_id):
-        self.tg.send(chat_id, (
-            "🤖 <b>UCL Live Bot</b>\n\n"
-            "پوشش لحظه‌ای همه بازی‌های چمپیونزلیگ:\n"
-            "⚽ گل + اسیست (ادیت خودکار) | ❌ گل مردود | 🟨🟥 کارت\n"
-            "🥅 پنالتی | 🔄 تعویض | 🏁 HT/FT + امتیاز فانتزی + آمار\n\n"
-            "<b>دستورات (فقط ادمین بات):</b>\n"
-            "/today — بازی‌های امروز و فردا\n"
-            "/mute — قطع نوتیف یک بازی (ضد اسپویل)\n"
-            "/unmute — وصل کردن دوباره\n"
-            "/mutes — لیست بازی‌های موت‌شده\n"
-            "/status — وضعیت ربات\n\n"
-            "بات روی بازیِ موت‌شده هیچ پیامی نمی‌فرسته و ادیت هم نمی‌زنه.")
-        )
-
     def cmd_today(self, chat_id):
         rows, _ = self.today_rows()
         if not rows:
             self.tg.send(chat_id, "امروز و فردا بازی چمپیونزلیگی نیست.")
             return
         self.tg.send(chat_id, "📅 <b>UEFA Champions League</b>\n" + "\n".join(rows))
-
-    def cmd_mute(self, chat_id):
-        with self.lock:
-            ms = sorted(self.matches.values(), key=lambda m: m.get("date") or "")
-        mutes = self.store.mutes()
-        btns = []
-        for m in ms:
-            if str(m["id"]) in mutes or m.get("state") == "post":
-                continue
-            h, a = m.get("home") or {}, m.get("away") or {}
-            when = (m.get("date") or "")[11:16]
-            btns.append([{"text": f"🔇 {h.get('abbr')} vs {a.get('abbr')} {when} UTC",
-                          "callback_data": f"mute:{m['id']}"}])
-        if not btns:
-            self.tg.send(chat_id, "بازی فعالی برای موت کردن نیست.")
-            return
-        kb = {"inline_keyboard": btns + [[{"text": "❌ بستن", "callback_data": "close"}]]}
-        self.tg.send(chat_id, "کدوم بازی نوتیفش قطع بشه؟", kb=kb)
-
-    def cmd_unmute(self, chat_id):
-        mutes = self.store.mutes()
-        if not mutes:
-            self.tg.send(chat_id, "چیزی موت نشده 🔊")
-            return
-        btns = [[{"text": f"🔊 {label}", "callback_data": f"unmute:{mid}"}]
-                for mid, label in mutes.items()]
-        kb = {"inline_keyboard": btns + [[{"text": "❌ بستن", "callback_data": "close"}]]}
-        self.tg.send(chat_id, "کدوم بازی وصل بشه؟", kb=kb)
-
-    def cmd_mutes(self, chat_id):
-        mutes = self.store.mutes()
-        if not mutes:
-            self.tg.send(chat_id, "لیست خالیه — همه بازی‌ها فعال‌ان 🔊")
-            return
-        self.tg.send(chat_id, "🔇 <b>موت‌شده‌ها:</b>\n" +
-                     "\n".join(f"• {label} (<code>{mid}</code>)" for mid, label in mutes.items()))
-
-    def cmd_status(self, chat_id):
-        with self.lock:
-            live = [m for m in self.matches.values() if m.get("state") == "in"]
-            total = len(self.matches)
-        up = int(time.time() - self.started)
-        self.tg.send(chat_id, (
-            "🤖 <b>Status</b>\n"
-            f"Uptime: {up//3600}h {(up%3600)//60}m\n"
-            f"Groups: {len(self.groups())}\n"
-            f"Matches: {total} | Live: {len(live)}\n"
-            f"Muted: {len(self.store.mutes())}\n"
-            f"Scoreboard refresh: {int(time.time()-self.last_board)}s ago"))
 
     # ---------------- updates ----------------
     def handle_update(self, u):
@@ -828,26 +764,12 @@ class Bot:
             self.store.kv_set("owner", str(uid))
 
         cmd = text.split()[0].split("@")[0].lower()
-        owner_cmds = {"/mute", "/unmute", "/mutes", "/status"}
-        if cmd in owner_cmds and not self.is_owner(uid):
-            self.tg.send(chat_id, "⛔ فقط ادمین بات دسترسی داره.")
-            return
         if cmd in ("/start", "/help"):
-            self.cmd_help(chat_id)
+            self.cmd_today(chat_id)   # only public command now
         elif cmd == "/panel" and ctype == "private" and self.is_owner(uid):
             self.cmd_panel(chat_id)
         elif cmd == "/today":
             self.cmd_today(chat_id)
-        elif cmd == "/mute":
-            self.cmd_mute(chat_id)
-        elif cmd == "/unmute":
-            self.cmd_unmute(chat_id)
-        elif cmd == "/mutes":
-            self.cmd_mutes(chat_id)
-        elif cmd == "/status":
-            self.cmd_status(chat_id)
-        elif cmd == "/ping":
-            self.tg.send(chat_id, "pong ✅")
 
     def handle_callback(self, cb):
         data = cb.get("data") or ""
