@@ -8,6 +8,7 @@ matches are never published (owner-controlled anti-spoiler).
 import datetime
 import hashlib
 import html
+import os
 import re
 import threading
 import time
@@ -69,6 +70,11 @@ class Bot:
         self.started = time.time()
         self.last_board = 0
         self._panel_fp = None
+        self.health = {}                    # source -> {ok, fail, err, n}
+        self._health_lock = threading.Lock()
+        self.last_alert = 0.0               # anomaly-alert throttle
+        self._stale_since = 0.0
+        self.threads = []
         if not self.owner:
             self.owner = int(self.store.kv_get("owner") or 0)
 
@@ -86,6 +92,115 @@ class Bot:
 
     def groups(self):
         return self.store.groups()
+
+    # ---------------- source health / self-reporting ----------------
+    # Railway access is not required to know the deploy is healthy: every
+    # process start DMs a receipt to OWNER_ID, /debug reports on demand, and
+    # total source outage during a LIVE match raises an alert.
+    def _mark(self, source, ok, err=None):
+        with self._health_lock:
+            h = self.health.setdefault(source, {"ok": 0.0, "fail": 0.0, "err": "", "n": 0})
+            if ok:
+                h["ok"] = time.time()
+                h["n"] += 1
+                h["err"] = ""
+            else:
+                h["fail"] = time.time()
+                h["err"] = str(err or "")[:120]
+
+    @staticmethod
+    def _ago(ts):
+        if not ts:
+            return "never"
+        d = int(time.time() - ts)
+        if d < 90:
+            return f"{d}s ago"
+        if d < 5400:
+            return f"{d // 60}m ago"
+        return f"{d // 3600}h ago"
+
+    def _commit(self):
+        return (os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:7] or "local"
+
+    def _health_lines(self):
+        with self._health_lock:
+            snap = {k: dict(v) for k, v in self.health.items()}
+        out = []
+        for src in ("uefa", "fotmob", "espn", "tg"):
+            h = snap.get(src)
+            if not h:
+                out.append(f"  {src}: idle")
+                continue
+            err = f" | err: {esc(h['err'])}" if h["err"] else ""
+            out.append(f"  {src}: ok {self._ago(h['ok'])} (n={h['n']})"
+                       f" | last fail {self._ago(h['fail'])}{err}")
+        return out
+
+    def _report(self, short=False):
+        with self.lock:
+            n_matches = len(self.matches)
+            n_live = sum(1 for m in self.matches.values() if m.get("state") == "in")
+        groups = len(self.groups())
+        up = int(time.time() - self.started)
+        vol = "✓ attached" if DB_PATH.startswith("/data") else "⚠️ MISSING (ephemeral DB!)"
+        tok = "✓" if BOT_TOKEN else "✗ MISSING"
+        lines = [
+            "🩺 <b>UCL Live Bot — status</b>" if not short else "🚀 <b>UCL Live Bot online</b>",
+            f"commit: <code>{self._commit()}</code> | uptime: {up // 3600}h {(up % 3600) // 60}m",
+            f"db: <code>{esc(DB_PATH)}</code> | volume: {vol}",
+            f"groups: {groups} | matches: {n_matches} (live: {n_live})",
+        ]
+        if short:
+            with self._health_lock:
+                fresh = {k: v.get("ok", 0) for k, v in self.health.items()}
+            lines.append("sources: " + " · ".join(
+                f"{s} {self._ago(fresh.get(s, 0))}" for s in ("uefa", "fotmob", "espn", "tg")))
+        else:
+            lines.append("threads: " + " · ".join(
+                f"{t.name} {'✓' if t.is_alive() else '✗ DEAD'}" for t in self.threads) or "threads: —")
+            lines.append("sources:")
+            lines.extend(self._health_lines())
+        lines.append(f"cfg: POLL={POLL_SECONDS} FM={FM_POLL_SECONDS} UEFA={UEFA_POLL_SECONDS} "
+                     f"BOARD={SCOREBOARD_SECONDS} | LEAGUE={esc(LEAGUE_SLUG)} | "
+                     f"BOT_TOKEN {tok} | FANTASY={int(FANTASY)} LINEUPS={int(SHOW_LINEUPS)} "
+                     f"STATS={int(SHOW_STATS_BLOCK)} KO={int(KICKOFF_MSG)}")
+        return "\n".join(lines)
+
+    def _dm_owner(self, text):
+        if not self.owner:
+            return False
+        try:
+            self.tg.send(self.owner, text)
+            return True
+        except TGError as e:
+            print(f"[receipt fail] {e}", flush=True)
+            return False
+
+    def _send_receipt(self):
+        if not self.owner:
+            print("[receipt] OWNER_ID not set — skip", flush=True)
+            return
+        self._dm_owner(self._report(short=True))
+
+    def anomaly_check(self):
+        """LIVE match but every source is stale -> DM the owner (throttled)."""
+        with self.lock:
+            n_live = sum(1 for m in self.matches.values() if m.get("state") == "in")
+        if not n_live:
+            self._stale_since = 0.0
+            return
+        with self._health_lock:
+            ok_ts = [self.health.get(s, {}).get("ok", 0.0) for s in ("uefa", "fotmob", "espn")]
+        now = time.time()
+        if now - max(ok_ts) < 60:
+            self._stale_since = 0.0
+            return
+        if not self._stale_since:
+            self._stale_since = now
+        elif now - self._stale_since >= 60 and now - self.last_alert > 600:
+            self.last_alert = now
+            self._dm_owner(f"⚠️ LIVE match but ALL sources stale >60s — send /debug"
+                           f" (commit {self._commit()})")
 
     # ---------------- admin panel ----------------
     PANEL_MAX_ROWS = 12
@@ -265,8 +380,10 @@ class Bot:
     def poll_match(self, mid):
         try:
             s = espn.summary(LEAGUE_SLUG, mid)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            self._mark("espn", False, e)
             return
+        self._mark("espn", True)
         st = self.ensure_state(mid)
         comp = s.get("competitors") or {}
         if not comp.get("home"):
@@ -663,7 +780,9 @@ class Bot:
             try:
                 msg = self.tg.send(chat_id, text)
                 self.store.save_msg(event_key, chat_id, msg["message_id"], text)
+                self._mark("tg", True)
             except TGError as e:
+                self._mark("tg", False, e)
                 print(f"[send fail {chat_id}] {e}", flush=True)
 
     def edit_event(self, event_key, text):
@@ -673,7 +792,9 @@ class Bot:
             try:
                 self.tg.edit(chat_id, message_id, text)
                 self.store.update_msg_text(event_key, chat_id, text)
+                self._mark("tg", True)
             except TGError as e:
+                self._mark("tg", False, e)
                 print(f"[edit fail {chat_id}] {e}", flush=True)
 
     # ---------------- lanes (concurrency model) ----------------
@@ -703,6 +824,7 @@ class Bot:
                                          (m.get("away") or {}).get("name"))
                         except Exception:  # noqa: BLE001
                             traceback.print_exc()
+                self.anomaly_check()
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
 
@@ -767,6 +889,7 @@ class Bot:
         st = self.ensure_state(mid)
         for fmid in self.fm_resolve(mid, hname, aname):
             f, changed = fotmob.match_changed(fmid)
+            self._mark("fotmob", bool(f), "empty payload" if not f else None)
             if not f:
                 continue
             stt = fotmob.status(f)
@@ -852,8 +975,10 @@ class Bot:
         clubs = uefa.club_map(um) if um else {}
         try:
             evs = uefa.events(st.uefa_mid)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            self._mark("uefa", False, e)
             return
+        self._mark("uefa", True)
         comp = self.espn_comp(mid)
         for e in evs:
             ke = uefa.normalize_event(e, clubs)
@@ -875,6 +1000,9 @@ class Bot:
             self.tg.send(chat_id, "امروز و فردا بازی چمپیونزلیگی نیست.")
             return
         self.tg.send(chat_id, "📅 <b>UEFA Champions League</b>\n" + "\n".join(rows))
+
+    def cmd_debug(self, chat_id):
+        self.tg.send(chat_id, self._report(short=False))
 
     # ---------------- updates ----------------
     def handle_update(self, u):
@@ -912,6 +1040,8 @@ class Bot:
             self.cmd_today(chat_id)   # only public command now
         elif cmd == "/panel" and ctype == "private" and self.is_owner(uid):
             self.cmd_panel(chat_id)
+        elif cmd == "/debug" and ctype == "private" and self.is_owner(uid):
+            self.cmd_debug(chat_id)
         elif cmd == "/today":
             self.cmd_today(chat_id)
 
@@ -1040,11 +1170,19 @@ class Bot:
         self._panel_reedit(chat_id, msg_id)
 
     def run(self):
-        threading.Thread(target=self.board_loop, daemon=True).start()
-        threading.Thread(target=self.fast_loop, daemon=True).start()
-        threading.Thread(target=self.espn_loop, daemon=True).start()
-        threading.Thread(target=self.panel_loop, daemon=True).start()
+        self.threads = [
+            threading.Thread(target=self.board_loop, daemon=True, name="board"),
+            threading.Thread(target=self.fast_loop, daemon=True, name="fast"),
+            threading.Thread(target=self.espn_loop, daemon=True, name="espn"),
+            threading.Thread(target=self.panel_loop, daemon=True, name="panel"),
+        ]
+        for t in self.threads:
+            t.start()
         print("UCL Live Bot started.", flush=True)
+        try:
+            self._send_receipt()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
         while True:
             try:
                 for u in self.tg.get_updates():

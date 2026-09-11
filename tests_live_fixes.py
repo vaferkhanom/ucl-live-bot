@@ -14,6 +14,7 @@ reachable. Each test maps to a diagnosed root cause:
 import json
 import os
 import sys
+import time
 import tempfile
 import unittest
 import urllib.request
@@ -26,6 +27,7 @@ os.environ.setdefault("OWNER_ID", "1")
 os.environ.setdefault("DB_PATH", os.path.join(tempfile.mkdtemp(), "test.db"))
 
 import bot as botmod
+from store import Store
 import espn
 import fotmob
 from bot import Bot
@@ -62,6 +64,7 @@ class FakeTG:
 def make_bot():
     b = Bot()
     b.tg = FakeTG()
+    b.store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))  # fresh DB per bot
     b.store.upsert_group(12345, "Test Group")
     return b
 
@@ -312,6 +315,71 @@ class TestUefaSource(unittest.TestCase):
             uefa.status_by_id, uefa.events = orig_status, orig_events
         self.assertEqual(b.matches[mid]["state"], "in", "UEFA LIVE must trigger kickoff")
         self.assertEqual(st.next_poll, 0.0, "ESPN lane must poll immediately")
+
+
+class TestSelfReporting(unittest.TestCase):
+    """Bot verifies its own Railway deploy via Telegram — no Railway token."""
+
+    def test_receipt_sent_to_owner(self):
+        b = make_bot()
+        b._send_receipt()
+        self.assertTrue(b.tg.sent, "receipt must be DM'd to OWNER_ID on start")
+        txt = b.tg.sent[-1][1]
+        self.assertIn("online", txt)
+        self.assertIn("commit:", txt)
+        self.assertIn("volume:", txt)
+        self.assertNotIn("ghp_", txt)  # never leak secrets
+
+    def test_receipt_no_owner_no_crash(self):
+        b = make_bot()
+        b.owner = 0
+        self.assertFalse(b._send_receipt())   # skip silently
+
+    def test_health_marks_and_report(self):
+        b = make_bot()
+        b._mark("uefa", True)
+        b._mark("espn", False, "boom <timeout>")
+        txt = b._report(short=False)
+        self.assertIn("uefa: ok", txt)
+        self.assertIn("espn: ok never", txt)
+        self.assertIn("boom &lt;timeout&gt;", txt)   # HTML-escaped, no raw tags
+        b._mark("espn", True)   # recovery clears the error field
+        self.assertNotIn("err:", b._report().split("espn:")[1].split("\n")[0])
+
+    def test_anomaly_alert_only_when_all_stale_and_live(self):
+        b = make_bot()
+        mid = "999020"
+        b.matches[mid] = {"id": mid, "state": "in",
+                          "home": {"id": "1", "abbr": "A", "name": "Alpha", "short": "A", "color": "0000FF", "score": 0},
+                          "away": {"id": "2", "abbr": "X", "name": "Xray", "short": "X", "color": "FF0000", "score": 0}}
+        old = time.time() - 3600
+        for s in ("uefa", "fotmob", "espn"):
+            b._mark(s, True)
+            b.health[s]["ok"] = old        # force stale
+        b.anomaly_check()
+        b._stale_since -= 120              # stale window elapsed
+        b.anomaly_check()
+        self.assertTrue(any("ALL sources stale" in t for _, t in b.tg.sent),
+                        "must DM the owner on total source outage")
+        n = len(b.tg.sent)
+        b.anomaly_check()                  # throttle: no immediate repeat
+        self.assertEqual(len(b.tg.sent), n)
+        # fresh source clears the alert state
+        b._mark("uefa", True)
+        b._stale_since = 0.0
+        b2_sent = len(b.tg.sent)
+        b.anomaly_check()
+        self.assertEqual(len(b.tg.sent), b2_sent)
+
+    def test_debug_command_owner_only(self):
+        b = make_bot()
+        b.handle_message({"from": {"id": 1}, "chat": {"id": 1, "type": "private"}, "text": "/debug"})
+        self.assertTrue(any("status" in t for _, t in b.tg.sent))
+        n = len(b.tg.sent)
+        b.handle_message({"from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "/debug"})
+        self.assertEqual(len(b.tg.sent), n, "non-owner must get nothing")
+        b.handle_message({"from": {"id": 1}, "chat": {"id": -100, "type": "supergroup"}, "text": "/debug"})
+        self.assertEqual(len(b.tg.sent), n, "group /debug must be ignored")
 
 
 class TestFindIds(unittest.IsolatedAsyncioTestCase):
